@@ -38,9 +38,11 @@ import json
 import mimetypes
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -306,6 +308,11 @@ def parse_args():
     p.add_argument("--request-delay", type=float, default=1.0,
                    help="Seconds to sleep before each clip's request (throttle "
                         "the single-threaded server). Default 1.0.")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Number of clips to caption in parallel. Set to the "
+                        "number of caption-qwen3-vl server pods behind the svc "
+                        "so each pod stays busy (each pod serves one request at "
+                        "a time). Default 1 (serial).")
     return p.parse_args()
 
 
@@ -337,85 +344,124 @@ def main():
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    processed = ok = failed = 0
+    # Build the work list (skip resumed clip_ids, honor --max-clips).
+    todo = []
+    for path in sampled:
+        cid = clip_id(path)
+        if cid in done:
+            continue
+        todo.append((cid, path))
+        if args.max_clips and len(todo) >= args.max_clips:
+            break
+    eprint(f"To caption this run: {len(todo)} clips "
+           f"(concurrency={args.concurrency})")
+
     latencies = []
     t_start = time.time()
+    lock = threading.Lock()
+    counters = {"processed": 0, "ok": 0, "failed": 0}
+
+    def caption_one(cid, path):
+        """Do all network/CPU work for one clip; return the JSONL record.
+        Runs in a worker thread — must NOT touch shared state or the file."""
+        label = derive_label(path, args.label_from, labels_csv)
+        payload = build_payload(path, label, args.model, args.max_tokens,
+                                args.send_path, args.resize)
+
+        # Optional throttle before each request (per worker).
+        if args.request_delay > 0:
+            time.sleep(args.request_delay)
+
+        raw = None
+        err = None
+        dt = 0.0
+        for attempt in range(args.retries + 1):
+            t0 = time.time()
+            try:
+                raw = post_chat(args.endpoint, payload, args.timeout)
+                dt = time.time() - t0
+                err = None
+                break
+            except (urllib.error.URLError, urllib.error.HTTPError,
+                    TimeoutError, ConnectionError) as e:
+                err = str(e)
+                if attempt < args.retries:
+                    time.sleep(2 * (attempt + 1))
+
+        rec = {"clip_id": cid, "video": str(path), "label": label}
+        status = "ok"
+        if raw is None:
+            status = "fail"
+            rec["error"] = err or "unknown"
+        else:
+            try:
+                parsed = parse_model_json(raw)
+                rec.update({
+                    "prompt": parsed.get("prompt", "").strip(),
+                    "camera_motion": parsed.get("camera_motion"),
+                    "subject_motion": parsed.get("subject_motion"),
+                    "motion_intensity": parsed.get("motion_intensity"),
+                    "motion_type": parsed.get("motion_type"),
+                })
+            except (json.JSONDecodeError, ValueError) as e:
+                status = "badjson"
+                rec["error"] = f"json_parse: {e}"
+                rec["raw"] = raw
+        return rec, status, dt
+
+    def record_result(out_f, rec, status, dt):
+        """Called on the main thread under `lock`: update counters, write line."""
+        counters["processed"] += 1
+        if status == "ok":
+            counters["ok"] += 1
+            latencies.append(dt)
+        else:
+            counters["failed"] += 1
+            eprint(f"[{counters['processed']}] {status.upper()} "
+                   f"{rec['clip_id']}: {rec.get('error')}")
+        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        out_f.flush()
+        if counters["processed"] % 10 == 0:
+            avg = sum(latencies) / len(latencies) if latencies else 0
+            eprint(f"  progress: {counters['processed']} done "
+                   f"(ok={counters['ok']} fail={counters['failed']}) "
+                   f"avg={avg:.1f}s/clip")
 
     with args.out.open("a") as out_f:
-        for path in sampled:
-            cid = clip_id(path)
-            if cid in done:
-                continue
-            if args.max_clips and processed >= args.max_clips:
-                eprint(f"Reached --max-clips={args.max_clips}, stopping")
-                break
-            processed += 1
+        if args.concurrency <= 1:
+            for cid, path in todo:
+                rec, status, dt = caption_one(cid, path)
+                with lock:
+                    record_result(out_f, rec, status, dt)
+        else:
+            # Thread pool: N in-flight requests fan out across the N server pods
+            # behind the svc (each pod handles one at a time). The file write and
+            # counters are serialized under `lock`, so the resumable JSONL stays
+            # consistent.
+            with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+                futures = {ex.submit(caption_one, cid, path): cid
+                           for cid, path in todo}
+                for fut in as_completed(futures):
+                    rec, status, dt = fut.result()
+                    with lock:
+                        record_result(out_f, rec, status, dt)
 
-            label = derive_label(path, args.label_from, labels_csv)
-            payload = build_payload(path, label, args.model, args.max_tokens,
-                                    args.send_path, args.resize)
-
-            # Throttle: the server processes one request at a time (global
-            # inference lock); a small pre-call delay eases pressure on it.
-            if args.request_delay > 0:
-                time.sleep(args.request_delay)
-
-            raw = None
-            err = None
-            for attempt in range(args.retries + 1):
-                t0 = time.time()
-                try:
-                    raw = post_chat(args.endpoint, payload, args.timeout)
-                    latencies.append(time.time() - t0)
-                    err = None
-                    break
-                except (urllib.error.URLError, urllib.error.HTTPError,
-                        TimeoutError, ConnectionError) as e:
-                    err = str(e)
-                    if attempt < args.retries:
-                        time.sleep(2 * (attempt + 1))
-
-            rec = {"clip_id": cid, "video": str(path), "label": label}
-            if raw is None:
-                failed += 1
-                rec["error"] = err or "unknown"
-                eprint(f"[{processed}] FAIL {cid}: {err}")
-            else:
-                try:
-                    parsed = parse_model_json(raw)
-                    rec.update({
-                        "prompt": parsed.get("prompt", "").strip(),
-                        "camera_motion": parsed.get("camera_motion"),
-                        "subject_motion": parsed.get("subject_motion"),
-                        "motion_intensity": parsed.get("motion_intensity"),
-                        "motion_type": parsed.get("motion_type"),
-                    })
-                    ok += 1
-                except (json.JSONDecodeError, ValueError) as e:
-                    # Keep the raw text so a bad-JSON clip is inspectable, not lost.
-                    failed += 1
-                    rec["error"] = f"json_parse: {e}"
-                    rec["raw"] = raw
-                    eprint(f"[{processed}] BADJSON {cid}: {e}")
-
-            out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out_f.flush()
-
-            if processed % 10 == 0:
-                avg = sum(latencies) / len(latencies) if latencies else 0
-                eprint(f"  progress: {processed} done "
-                       f"(ok={ok} fail={failed}) avg={avg:.1f}s/clip")
-
+    processed = counters["processed"]
+    ok = counters["ok"]
+    failed = counters["failed"]
     elapsed = time.time() - t_start
     avg = sum(latencies) / len(latencies) if latencies else 0
     eprint("─" * 60)
     eprint(f"Done. processed={processed} ok={ok} failed={failed}")
-    eprint(f"Wall time: {elapsed:.0f}s, avg successful req: {avg:.1f}s/clip")
-    if avg and len(all_clips):
-        # Rough projection to the full (100%) dataset at this per-clip cost.
-        full_est = avg * len(all_clips)
-        eprint(f"Projected single-replica time for all {len(all_clips)} clips: "
-               f"{full_est/3600:.1f}h (before parallel replicas)")
+    eprint(f"Wall time: {elapsed:.0f}s, avg successful req: {avg:.1f}s/clip, "
+           f"concurrency={args.concurrency}")
+    if processed and elapsed:
+        # Use measured wall-clock throughput (accounts for concurrency), not the
+        # per-request latency, so the projection reflects the parallel run.
+        eff = elapsed / processed  # effective seconds/clip incl. parallelism
+        eprint(f"Effective {eff:.1f}s/clip; projected for all "
+               f"{len(all_clips)} clips at this concurrency: "
+               f"{eff*len(all_clips)/3600:.1f}h")
     eprint(f"Output: {args.out}")
 
 

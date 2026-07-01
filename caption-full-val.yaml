@@ -51,7 +51,8 @@ spec:
               ANNO_URL="${ANNO_URL:-https://s3.amazonaws.com/kinetics/400/annotations/${SPLIT}.csv}"
               PERSIST_DIR="${PERSIST_DIR:-/var/mdl/video-distill/${SPLIT}}"
               RESIZE="${RESIZE:-448}"
-              REQUEST_DELAY="${REQUEST_DELAY:-1.0}"
+              REQUEST_DELAY="${REQUEST_DELAY:-0}"        # server stable; no throttle
+              CONCURRENCY="${CONCURRENCY:-2}"            # = number of caption-qwen3-vl pods
 
               WORK=/scratch
               mkdir -p "$WORK" "$PERSIST_DIR" && cd "$WORK"
@@ -97,6 +98,7 @@ spec:
                   --max-clips 0 \
                   --resize "$RESIZE" \
                   --request-delay "$REQUEST_DELAY" \
+                  --concurrency "$CONCURRENCY" \
                   --label-from csv \
                   --labels-csv "k400/annotations/${SPLIT}.csv"
 
@@ -132,6 +134,10 @@ spec:
               value: "val"
             - name: NUM_PARTS
               value: "20"
+            - name: CONCURRENCY
+              value: "2"            # match the number of caption-qwen3-vl pods
+            - name: REQUEST_DELAY
+              value: "0"
       volumes:
         - name: scratch
           emptyDir:
