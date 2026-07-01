@@ -1,0 +1,145 @@
+# Kinetics -> prompt-corpus caption probe job (CPU-only network client).
+#
+# What it does, end to end, in one pod:
+#   1. Clone the video-distill repo (this repo) for the scripts.
+#   2. Download ONE k400 validation part_*.tar.gz into local emptyDir scratch
+#      and extract it to k400/val/<clip>.mp4 (a few hundred clips, ephemeral).
+#   3. Fetch the k400 val annotations CSV so clips can be labeled by action.
+#   4. Run probe_shapes.py -> prints the frames/tokens/fits table to the log so
+#      you can decide whether QWEN3_VL_MAX_NFRAMES=4 is enough (STEP 3 in the
+#      plan — deciding + redeploying the qwen3-vl SERVER is a separate manual
+#      action; this job never touches the model server).
+#   5. Run caption_kinetics.py on a deterministic 10% sample, sending each clip
+#      as base64 video_url over the in-cluster svc to the trn2 Qwen3-VL server.
+#      Output is written to LOCAL emptyDir first (cheap, fast, crash-safe-ish).
+#   6. ONLY after the run finishes, copy captions.jsonl to the shared PVC at
+#      /var/mdl/video-distill/ so results persist after the pod dies.
+#
+# This pod is a pure HTTP client: it reads bytes, base64-encodes, and POSTs.
+# The trn2 SERVER samples frames and runs the model. Hence: CPU node, NO Neuron
+# resourceClaim, NO trn2 nodeSelector. Clips live in emptyDir (server can't see
+# them), so --send-path is impossible here; base64 transport is the only option.
+#
+# BEFORE APPLYING, set two things:
+#   * nodeSelector below -> a CPU (m-family) node label from:
+#       kubectl get no --show-labels
+#   * GIT_REPO / GIT_BRANCH env -> your pushed fork URL/branch.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kinetics-caption-probe
+  namespace: default
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: kinetics-caption-probe
+    spec:
+      restartPolicy: Never
+      # ── CPU node only. Replace with a real m-family label from your cluster.
+      # e.g. node.kubernetes.io/instance-type: m7i.4xlarge   (check node labels)
+      nodeSelector:
+        node-type: cpu
+      containers:
+        - name: caption
+          # Reuse the qwen3-vl image: it already has python3, uv, ffmpeg, git.
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              # ── Config (override via env) ──────────────────────────────────
+              GIT_REPO="${GIT_REPO:-https://github.com/yahavb/video-distill.git}"
+              GIT_BRANCH="${GIT_BRANCH:-main}"
+              ENDPOINT="${ENDPOINT:-http://qwen3-vl.default.svc.cluster.local:8000}"
+              SAMPLE_FRAC="${SAMPLE_FRAC:-0.10}"
+              MAX_CLIPS="${MAX_CLIPS:-100}"          # probe target: ~100 prompts
+              PART_URL="${PART_URL:-https://s3.amazonaws.com/kinetics/400/val/part_0.tar.gz}"
+              ANNO_URL="${ANNO_URL:-https://s3.amazonaws.com/kinetics/400/annotations/val.csv}"
+              PERSIST_DIR="${PERSIST_DIR:-/var/mdl/video-distill}"
+
+              WORK=/scratch
+              mkdir -p "$WORK" && cd "$WORK"
+
+              # ── 1. Scripts ────────────────────────────────────────────────
+              git clone -b "$GIT_BRANCH" "$GIT_REPO" "$WORK/video-distill"
+
+              # ── 2. Download ONE val part + extract to k400/val ────────────
+              mkdir -p k400/val k400/annotations
+              echo "Downloading part: $PART_URL"
+              wget -c -q "$PART_URL" -O part.tar.gz
+              tar zxf part.tar.gz -C k400/val
+              echo "Extracted $(find k400/val -name '*.mp4' | wc -l) clips"
+
+              # ── 3. Annotations for labeling ───────────────────────────────
+              wget -c -q "$ANNO_URL" -O k400/annotations/val.csv
+
+              # ── 4. Wait for the model server, then probe shapes ───────────
+              echo "Waiting for Qwen3-VL readiness at $ENDPOINT ..."
+              for i in $(seq 1 60); do
+                if curl -sf "$ENDPOINT/readiness" >/dev/null 2>&1; then
+                  echo "server ready"; break
+                fi
+                echo "  not ready ($i/60), sleeping 15s"; sleep 15
+              done
+
+              python3 "$WORK/video-distill/probe_shapes.py" \
+                --videos-dir k400/val \
+                --sample 300 \
+                --max-seq-len 4096 \
+                --frame-candidates 4,8,12,16 || true
+
+              # ── 5. Caption ~10% (100 clips) to LOCAL disk ─────────────────
+              OUT_LOCAL="$WORK/captions.jsonl"
+              python3 "$WORK/video-distill/caption_kinetics.py" \
+                --videos-dir k400/val \
+                --out "$OUT_LOCAL" \
+                --endpoint "$ENDPOINT" \
+                --sample-frac "$SAMPLE_FRAC" \
+                --max-clips "$MAX_CLIPS" \
+                --label-from csv \
+                --labels-csv k400/annotations/val.csv
+
+              # ── 6. Persist results to the shared PVC only after success ───
+              mkdir -p "$PERSIST_DIR"
+              STAMP="$(python3 -c 'import time; print(time.strftime("%Y%m%d-%H%M%S"))')"
+              cp "$OUT_LOCAL" "$PERSIST_DIR/captions-$STAMP.jsonl"
+              echo "Persisted -> $PERSIST_DIR/captions-$STAMP.jsonl"
+              echo "=== sample of results ==="
+              head -n 5 "$OUT_LOCAL" || true
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: GIT_REPO
+              value: "https://github.com/yahavb/video-distill.git"
+            - name: GIT_BRANCH
+              value: "main"
+            - name: ENDPOINT
+              value: "http://qwen3-vl.default.svc.cluster.local:8000"
+            - name: SAMPLE_FRAC
+              value: "0.10"
+            - name: MAX_CLIPS
+              value: "100"
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

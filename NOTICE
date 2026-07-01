@@ -1,0 +1,36 @@
+video-distill
+=============
+
+This project builds a Kinetics -> prompt-corpus captioning pipeline used to
+adapt video diffusion models (WAN2.2) for streaming inference (StreamDiffusion
+v2). It stands on the work of others; attribution below.
+
+--------------------------------------------------------------------------------
+Kinetics dataset
+--------------------------------------------------------------------------------
+The Kinetics Human Action Video Dataset was created by DeepMind.
+  Kay et al., "The Kinetics Human Action Video Dataset", arXiv:1705.06950.
+  Carreira et al., Kinetics-600 / Kinetics-700 follow-ups.
+  https://deepmind.com/research/open-source/kinetics
+
+Dataset hosting and the original downloader/extractor shell scripts
+(`k*_downloader.sh`, `k*_extractor.sh`, `arrange_by_classes.py`) are provided by
+the Common Visual Data Foundation (CVDF):
+  https://github.com/cvdfoundation/kinetics-dataset
+Those upstream scripts and all contributors to that repository retain their
+original authorship. Files derived from or depending on that repo are used in
+accordance with its terms.
+
+--------------------------------------------------------------------------------
+Models referenced
+--------------------------------------------------------------------------------
+Qwen3-VL (Alibaba / Qwen team) is used as the video captioner. WAN2.1 / WAN2.2
+are referenced as the video-generation models being adapted. These are the
+property of their respective authors and are used under their own licenses.
+
+--------------------------------------------------------------------------------
+This repository's own additions
+--------------------------------------------------------------------------------
+The captioning and shape-probe tooling (`caption_kinetics.py`,
+`probe_shapes.py`) and the Kubernetes job manifests were authored for this
+project and are released under the license in LICENSE.

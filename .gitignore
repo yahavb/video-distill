@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+captions*.jsonl
+k400/
+k700-2020/
+*.tar.gz
