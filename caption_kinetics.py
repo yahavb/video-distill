@@ -244,6 +244,9 @@ def parse_args():
                         "server shares this filesystem; avoids /tmp leak).")
     p.add_argument("--retries", type=int, default=2,
                    help="Retries per clip on transient errors.")
+    p.add_argument("--request-delay", type=float, default=1.0,
+                   help="Seconds to sleep before each clip's request (throttle "
+                        "the single-threaded server). Default 1.0.")
     return p.parse_args()
 
 
@@ -292,6 +295,11 @@ def main():
             label = derive_label(path, args.label_from, labels_csv)
             payload = build_payload(path, label, args.model, args.max_tokens,
                                     args.send_path)
+
+            # Throttle: the server processes one request at a time (global
+            # inference lock); a small pre-call delay eases pressure on it.
+            if args.request_delay > 0:
+                time.sleep(args.request_delay)
 
             raw = None
             err = None
