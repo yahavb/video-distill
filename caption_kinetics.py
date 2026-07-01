@@ -33,6 +33,7 @@ Layouts supported for deriving the action label:
 import argparse
 import base64
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -137,11 +138,64 @@ def video_to_data_uri(path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def reencode_fixed(path: Path, size: int) -> bytes:
+    """Re-encode a clip to a FIXED size x size resolution and return mp4 bytes.
+
+    Why fixed (not aspect-preserving): the Neuron vision graph is a static-shape
+    compiled NEFF. It emits a constant number of visual tokens for the ONE grid
+    it was compiled for. If clips arrive at varying resolutions, the per-clip
+    <video> placeholder count (computed on CPU) drifts away from that constant,
+    causing the [1152] vs [683] mismatch crash. Forcing every clip to the same
+    square resolution makes the grid constant -> the server compiles ONE video
+    NEFF (first request) and reuses it for all others. Aspect ratio is not
+    preserved (mild stretch); acceptable for motion-focused captioning.
+
+    Uses PyAV so no system ffmpeg binary is needed (the server image ships av).
+    """
+    import av  # local import: only needed when --resize is set
+
+    inp = av.open(str(path))
+    try:
+        istream = next(s for s in inp.streams if s.type == "video")
+        buf = io.BytesIO()
+        out = av.open(buf, mode="w", format="mp4")
+        try:
+            # Cap fps modestly; the server subsamples frames anyway.
+            rate = istream.average_rate or 25
+            ostream = out.add_stream("libx264", rate=rate)
+            ostream.width = size
+            ostream.height = size
+            ostream.pix_fmt = "yuv420p"
+            for frame in inp.decode(istream):
+                frame = frame.reformat(width=size, height=size, format="yuv420p")
+                for pkt in ostream.encode(frame):
+                    out.mux(pkt)
+            for pkt in ostream.encode():  # flush
+                out.mux(pkt)
+        finally:
+            out.close()
+        return buf.getvalue()
+    finally:
+        inp.close()
+
+
+def video_bytes_to_data_uri(data: bytes) -> str:
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:video/mp4;base64,{b64}"
+
+
 def build_payload(path: Path, label: str, model: str, max_tokens: int,
-                  use_path: bool) -> dict:
+                  use_path: bool, resize: int = 0) -> dict:
     """OpenAI-compatible request body. The server turns the video_url into a
-    {"type": "video", ...} content part and samples MAX_NFRAMES frames."""
-    if use_path:
+    {"type": "video", ...} content part and samples MAX_NFRAMES frames.
+
+    resize>0 re-encodes the clip to a fixed resize x resize resolution so every
+    request hits the SAME static vision NEFF on the server (avoids the varying
+    grid -> visual-token mismatch crash). resize overrides use_path (the server
+    can't read our in-memory re-encoded bytes from disk)."""
+    if resize > 0:
+        video_ref = video_bytes_to_data_uri(reencode_fixed(path, resize))
+    elif use_path:
         video_ref = str(path)  # server reads the path directly (same host/mount)
     else:
         video_ref = video_to_data_uri(path)  # portable: base64 over the wire
@@ -242,6 +296,11 @@ def parse_args():
     p.add_argument("--send-path", action="store_true",
                    help="Send the file path instead of base64 (only when the "
                         "server shares this filesystem; avoids /tmp leak).")
+    p.add_argument("--resize", type=int, default=448,
+                   help="Re-encode each clip to a fixed NxN resolution before "
+                        "sending, so every request hits the same static vision "
+                        "NEFF on the server (prevents the visual-token mismatch "
+                        "crash). Default 448. Set 0 to disable (send original).")
     p.add_argument("--retries", type=int, default=2,
                    help="Retries per clip on transient errors.")
     p.add_argument("--request-delay", type=float, default=1.0,
@@ -294,7 +353,7 @@ def main():
 
             label = derive_label(path, args.label_from, labels_csv)
             payload = build_payload(path, label, args.model, args.max_tokens,
-                                    args.send_path)
+                                    args.send_path, args.resize)
 
             # Throttle: the server processes one request at a time (global
             # inference lock); a small pre-call delay eases pressure on it.
