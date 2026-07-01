@@ -37,10 +37,9 @@ spec:
         app: kinetics-caption-probe
     spec:
       restartPolicy: Never
-      # ── CPU node only. Replace with a real m-family label from your cluster.
-      # e.g. node.kubernetes.io/instance-type: m7i.4xlarge   (check node labels)
+      # ── Pinned to a specific CPU node by hostname.
       nodeSelector:
-        node-type: cpu
+        kubernetes.io/hostname: ip-192-168-151-111.ap-southeast-4.compute.internal
       containers:
         - name: caption
           # Reuse the qwen3-vl image: it already has python3, uv, ffmpeg, git.
