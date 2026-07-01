@@ -1,0 +1,141 @@
+# Full k400 VALIDATION captioning — sequential, single caption-qwen3-vl server.
+#
+# Walks all 20 k400 val parts through the ONE caption-qwen3-vl endpoint (the
+# server has a global inference lock, so there is no client-side parallelism to
+# gain; more CPU replicas would just queue behind the same trn2 chip).
+#
+# Scale reality at ~11.3s/clip serialized: ~20k val clips ≈ ~63h single-server.
+# To go N× faster you need N caption-qwen3-vl SERVER replicas + client sharding,
+# not more of this job.
+#
+# S3 write policy: /var/mdl is a slow S3-backed PVC. We keep ALL per-clip I/O on
+# local emptyDir /scratch and copy to /var/mdl ONCE PER PART (20 writes total,
+# not per-clip). A single end-of-run write would risk losing ~2.5 days of work
+# if the pod is reclaimed; per-part gives crash-safety + resume with minimal S3.
+#
+# Resume: on (re)start, each part whose output already exists on /var/mdl is
+# seeded back to /scratch and the captioner skips clip_ids already present, so a
+# restarted pod continues where it stopped. Delete a part's .jsonl on /var/mdl
+# to force a re-caption of that part.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caption-full-val
+  namespace: default
+spec:
+  backoffLimit: 3          # allow restarts; resume makes them cheap
+  template:
+    metadata:
+      labels:
+        app: caption-full-val
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        kubernetes.io/hostname: ip-192-168-151-111.ap-southeast-4.compute.internal
+      containers:
+        - name: caption
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              GIT_REPO="${GIT_REPO:-https://github.com/yahavb/video-distill.git}"
+              GIT_BRANCH="${GIT_BRANCH:-main}"
+              ENDPOINT="${ENDPOINT:-http://caption-qwen3-vl.default.svc.cluster.local:8000}"
+              SPLIT="${SPLIT:-val}"
+              NUM_PARTS="${NUM_PARTS:-20}"       # k400 val = 20 parts
+              BASE_URL="${BASE_URL:-https://s3.amazonaws.com/kinetics/400/${SPLIT}}"
+              ANNO_URL="${ANNO_URL:-https://s3.amazonaws.com/kinetics/400/annotations/${SPLIT}.csv}"
+              PERSIST_DIR="${PERSIST_DIR:-/var/mdl/video-distill/${SPLIT}}"
+              RESIZE="${RESIZE:-448}"
+              REQUEST_DELAY="${REQUEST_DELAY:-1.0}"
+
+              WORK=/scratch
+              mkdir -p "$WORK" "$PERSIST_DIR" && cd "$WORK"
+
+              uv pip install av >/dev/null 2>&1 || pip install av
+              git clone -b "$GIT_BRANCH" "$GIT_REPO" "$WORK/video-distill"
+
+              # Annotations once (small).
+              mkdir -p k400/annotations
+              wget -c -q "$ANNO_URL" -O k400/annotations/${SPLIT}.csv
+
+              # Wait for the caption server.
+              echo "Waiting for $ENDPOINT ..."
+              for i in $(seq 1 120); do
+                curl -sf "$ENDPOINT/readiness" >/dev/null 2>&1 && { echo ready; break; }
+                echo "  not ready ($i), sleeping 15s"; sleep 15
+              done
+
+              # Sequentially process every part.
+              for n in $(seq 0 $((NUM_PARTS-1))); do
+                OUT_LOCAL="$WORK/${SPLIT}-part_${n}.jsonl"
+                OUT_PERSIST="$PERSIST_DIR/${SPLIT}-part_${n}.jsonl"
+
+                # Resume: seed local from persisted so done clip_ids are skipped.
+                if [[ -f "$OUT_PERSIST" ]]; then
+                  cp "$OUT_PERSIST" "$OUT_LOCAL"
+                fi
+
+                # Fresh extract dir per part (bounded disk).
+                rm -rf "$WORK/k400/${SPLIT}"
+                mkdir -p "$WORK/k400/${SPLIT}"
+                echo "=== part $n / $((NUM_PARTS-1)) ==="
+                wget -c -q "${BASE_URL}/part_${n}.tar.gz" -O "$WORK/part.tar.gz"
+                tar zxf "$WORK/part.tar.gz" -C "$WORK/k400/${SPLIT}"
+                rm -f "$WORK/part.tar.gz"
+
+                # Caption ALL clips in this part (frac=1.0, no cap).
+                python3 "$WORK/video-distill/caption_kinetics.py" \
+                  --videos-dir "$WORK/k400/${SPLIT}" \
+                  --out "$OUT_LOCAL" \
+                  --endpoint "$ENDPOINT" \
+                  --sample-frac 1.0 \
+                  --max-clips 0 \
+                  --resize "$RESIZE" \
+                  --request-delay "$REQUEST_DELAY" \
+                  --label-from csv \
+                  --labels-csv "k400/annotations/${SPLIT}.csv"
+
+                # ONE S3 write for this part.
+                cp "$OUT_LOCAL" "$OUT_PERSIST"
+                echo "Persisted part $n -> $OUT_PERSIST ($(wc -l < "$OUT_LOCAL") lines)"
+              done
+
+              echo "ALL PARTS DONE. Corpus at $PERSIST_DIR"
+              wc -l "$PERSIST_DIR"/*.jsonl | tail -1
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: GIT_REPO
+              value: "https://github.com/yahavb/video-distill.git"
+            - name: GIT_BRANCH
+              value: "main"
+            - name: ENDPOINT
+              value: "http://caption-qwen3-vl.default.svc.cluster.local:8000"
+            - name: SPLIT
+              value: "val"
+            - name: NUM_PARTS
+              value: "20"
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 30Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
