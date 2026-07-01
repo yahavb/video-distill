@@ -10,7 +10,8 @@
 #      plan — deciding + redeploying the qwen3-vl SERVER is a separate manual
 #      action; this job never touches the model server).
 #   5. Run caption_kinetics.py on a deterministic 10% sample, sending each clip
-#      as base64 video_url over the in-cluster svc to the trn2 Qwen3-VL server.
+#      as base64 video_url over the in-cluster svc to the DEDICATED caption
+#      Qwen3-VL server (caption-qwen3-vl, which runs the vision.py deepstack fix).
 #      Output is written to LOCAL emptyDir first (cheap, fast, crash-safe-ish).
 #   6. ONLY after the run finishes, copy captions.jsonl to the shared PVC at
 #      /var/mdl/video-distill/ so results persist after the pod dies.
@@ -27,14 +28,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kinetics-caption-probe
+  name: caption
   namespace: default
 spec:
   backoffLimit: 1
   template:
     metadata:
       labels:
-        app: kinetics-caption-probe
+        app: caption
     spec:
       restartPolicy: Never
       # ── Pinned to a specific CPU node by hostname.
@@ -54,7 +55,7 @@ spec:
               # ── Config (override via env) ──────────────────────────────────
               GIT_REPO="${GIT_REPO:-https://github.com/yahavb/video-distill.git}"
               GIT_BRANCH="${GIT_BRANCH:-main}"
-              ENDPOINT="${ENDPOINT:-http://qwen3-vl.default.svc.cluster.local:8000}"
+              ENDPOINT="${ENDPOINT:-http://caption-qwen3-vl.default.svc.cluster.local:8000}"
               SAMPLE_FRAC="${SAMPLE_FRAC:-0.10}"
               MAX_CLIPS="${MAX_CLIPS:-100}"          # probe target: ~100 prompts
               PART_URL="${PART_URL:-https://s3.amazonaws.com/kinetics/400/val/part_0.tar.gz}"
@@ -133,7 +134,7 @@ spec:
             - name: GIT_BRANCH
               value: "main"
             - name: ENDPOINT
-              value: "http://qwen3-vl.default.svc.cluster.local:8000"
+              value: "http://caption-qwen3-vl.default.svc.cluster.local:8000"
             - name: SAMPLE_FRAC
               value: "0.10"
             - name: MAX_CLIPS
