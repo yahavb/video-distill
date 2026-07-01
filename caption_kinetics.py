@@ -168,8 +168,20 @@ def post_chat(endpoint: str, payload: dict, timeout: float) -> str:
         endpoint.rstrip("/") + "/v1/chat/completions",
         data=data, headers={"Content-Type": "application/json"}, method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Surface the server's error body — for this server a 500 usually means
+        # the clip's resolution produced a vision-token count that overflowed
+        # MAX_SEQ_LEN or failed to compile a prefill NEFF. Include it so the
+        # caller can log *why*, not just "500".
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            detail = ""
+        raise urllib.error.HTTPError(
+            e.url, e.code, f"{e.reason}: {detail}", e.headers, None)
     return body["choices"][0]["message"]["content"]
 
 

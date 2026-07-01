@@ -64,6 +64,9 @@ spec:
               WORK=/scratch
               mkdir -p "$WORK" && cd "$WORK"
 
+              # ── 0. Deps: PyAV for shape probing (no system ffmpeg in image) ─
+              uv pip install av >/dev/null 2>&1 || pip install av
+
               # ── 1. Scripts ────────────────────────────────────────────────
               git clone -b "$GIT_BRANCH" "$GIT_REPO" "$WORK/video-distill"
 
@@ -112,11 +115,11 @@ spec:
               head -n 5 "$OUT_LOCAL" || true
           resources:
             requests:
-              cpu: "8"
-              memory: 32Gi
+              cpu: "100"
+              memory: 320Gi
             limits:
-              cpu: "8"
-              memory: 32Gi
+              cpu: "100"
+              memory: 320Gi
           volumeMounts:
             - name: scratch
               mountPath: /scratch

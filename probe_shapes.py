@@ -4,14 +4,16 @@
 Answers the practical question: "can we caption with QWEN3_VL_MAX_NFRAMES=4,
 or do we need to extend the frame budget (and recompile)?"
 
-It runs `ffprobe` over a sample of .mp4 clips and reports the distribution of
+It reads metadata from a sample of .mp4 clips and reports the distribution of
 resolution / fps / duration, then computes — for a range of candidate frame
 counts — the resulting Qwen3-VL vision-token count and whether it fits within
 MAX_SEQ_LEN. Motion-sampling density (seconds between sampled frames) is also
 reported, since that is what limits the reliability of the motion fields
 (motion_type / motion_intensity / camera_motion) in the captions.
 
-No model or network needed — just ffprobe on the PATH.
+Uses PyAV (`import av`) for metadata — the same library the Qwen3-VL server
+image already installs (`uv pip install av`) — so no system ffmpeg/ffprobe is
+required. Falls back to the `ffprobe` binary if PyAV is unavailable.
 
 Qwen3-VL / Qwen2-VL vision tokenization (used for the estimate):
     - patch size 14, spatial merge 2  -> one token per 28x28 pixel block
@@ -47,8 +49,38 @@ def stable_fraction_hash(key: str) -> float:
     return int(h[:8], 16) / 0xFFFFFFFF
 
 
-def ffprobe_video(path: Path):
-    """Return (width, height, fps, duration_s) or None on failure."""
+try:
+    import av  # PyAV — present in the Qwen3-VL server image
+    _HAVE_AV = True
+except ImportError:
+    _HAVE_AV = False
+
+
+def _probe_av(path: Path):
+    """Return (width, height, fps, duration_s) via PyAV, or None on failure."""
+    try:
+        with av.open(str(path)) as container:
+            vstreams = [s for s in container.streams if s.type == "video"]
+            if not vstreams:
+                return None
+            st = vstreams[0]
+            w = int(st.codec_context.width)
+            h = int(st.codec_context.height)
+            fps = float(st.average_rate) if st.average_rate else 0.0
+            # Duration: prefer stream, fall back to container (both in their
+            # own time_base / microseconds respectively).
+            dur = 0.0
+            if st.duration is not None and st.time_base:
+                dur = float(st.duration * st.time_base)
+            elif container.duration:
+                dur = float(container.duration) / 1_000_000.0
+            return w, h, fps, dur
+    except Exception:
+        return None
+
+
+def _probe_ffprobe(path: Path):
+    """Fallback: return (width, height, fps, duration_s) via the ffprobe CLI."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -57,8 +89,8 @@ def ffprobe_video(path: Path):
     ]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        raise RuntimeError(str(e))
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
     if out.returncode != 0:
         return None
     try:
@@ -71,6 +103,13 @@ def ffprobe_video(path: Path):
         return w, h, fps, dur
     except (KeyError, IndexError, ValueError, ZeroDivisionError):
         return None
+
+
+def probe_video(path: Path):
+    """Return (width, height, fps, duration_s) or None on failure."""
+    if _HAVE_AV:
+        return _probe_av(path)
+    return _probe_ffprobe(path)
 
 
 def tokens_per_frameset(w: int, h: int, nframes: int) -> int:
@@ -104,9 +143,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if not shutil.which("ffprobe"):
-        eprint("ffprobe not found on PATH. Install ffmpeg first.")
+    if not _HAVE_AV and not shutil.which("ffprobe"):
+        eprint("Neither PyAV (import av) nor ffprobe is available. "
+               "Install one: `uv pip install av`.")
         sys.exit(1)
+    eprint(f"Metadata backend: {'PyAV' if _HAVE_AV else 'ffprobe CLI'}")
     if not args.videos_dir.exists():
         eprint(f"videos-dir does not exist: {args.videos_dir}")
         sys.exit(1)
@@ -114,7 +155,7 @@ def main():
     candidates = [int(x) for x in args.frame_candidates.split(",") if x.strip()]
 
     clips = sorted(args.videos_dir.rglob("*.mp4"))
-    eprint(f"Found {len(clips)} clips; sampling up to {args.sample} for ffprobe")
+    eprint(f"Found {len(clips)} clips; sampling up to {args.sample} for probing")
     if not clips:
         sys.exit(1)
 
@@ -126,7 +167,7 @@ def main():
     fpss, durs, widths, heights = [], [], [], []
     failed = 0
     for path in sample:
-        info = ffprobe_video(path)
+        info = probe_video(path)
         if info is None:
             failed += 1
             continue
