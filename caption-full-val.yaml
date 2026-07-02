@@ -70,6 +70,12 @@ spec:
               mkdir -p "$WORK" "$PERSIST_DIR" && cd "$WORK"
 
               uv pip install av >/dev/null 2>&1 || pip install av
+
+              # Idempotent clone: emptyDir survives in-place container restarts,
+              # so a plain `git clone` into an existing dir fails under `set -e`
+              # and crash-loops. Remove any prior checkout first (fresh + always
+              # latest branch code on restart).
+              rm -rf "$WORK/video-distill"
               git clone -b "$GIT_BRANCH" "$GIT_REPO" "$WORK/video-distill"
 
               # Annotations once (small).

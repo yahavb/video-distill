@@ -68,7 +68,8 @@ spec:
               # ── 0. Deps: PyAV for shape probing (no system ffmpeg in image) ─
               uv pip install av >/dev/null 2>&1 || pip install av
 
-              # ── 1. Scripts ────────────────────────────────────────────────
+              # ── 1. Scripts (idempotent: emptyDir survives restarts) ───────
+              rm -rf "$WORK/video-distill"
               git clone -b "$GIT_BRANCH" "$GIT_REPO" "$WORK/video-distill"
 
               # ── 2. Download ONE val part + extract to k400/val ────────────
