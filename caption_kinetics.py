@@ -158,7 +158,9 @@ def reencode_fixed(path: Path, size: int) -> bytes:
 
     inp = av.open(str(path))
     try:
-        istream = next(s for s in inp.streams if s.type == "video")
+        istream = next((s for s in inp.streams if s.type == "video"), None)
+        if istream is None:
+            raise ValueError("no video stream (corrupt or audio-only clip)")
         buf = io.BytesIO()
         out = av.open(buf, mode="w", format="mp4")
         try:
@@ -363,10 +365,20 @@ def main():
 
     def caption_one(cid, path):
         """Do all network/CPU work for one clip; return the JSONL record.
-        Runs in a worker thread — must NOT touch shared state or the file."""
+        Runs in a worker thread — must NOT touch shared state or the file.
+        Must NEVER raise: one bad clip must not crash the whole run."""
         label = derive_label(path, args.label_from, labels_csv)
-        payload = build_payload(path, label, args.model, args.max_tokens,
-                                args.send_path, args.resize)
+
+        # Building the payload can fail on corrupt/streamless clips (PyAV
+        # re-encode). Treat any such failure as a per-clip failure, not a
+        # run-ending crash — Kinetics has known-bad files.
+        try:
+            payload = build_payload(path, label, args.model, args.max_tokens,
+                                    args.send_path, args.resize)
+        except Exception as e:  # noqa: BLE001 — deliberately catch-all per clip
+            return ({"clip_id": cid, "video": str(path), "label": label,
+                     "error": f"encode: {type(e).__name__}: {e}"},
+                    "fail", 0.0)
 
         # Optional throttle before each request (per worker).
         if args.request_delay > 0:
@@ -442,7 +454,12 @@ def main():
                 futures = {ex.submit(caption_one, cid, path): cid
                            for cid, path in todo}
                 for fut in as_completed(futures):
-                    rec, status, dt = fut.result()
+                    cid = futures[fut]
+                    try:
+                        rec, status, dt = fut.result()
+                    except Exception as e:  # noqa: BLE001 — never let one clip kill the run
+                        rec = {"clip_id": cid, "error": f"worker: {type(e).__name__}: {e}"}
+                        status, dt = "fail", 0.0
                     with lock:
                         record_result(out_f, rec, status, dt)
 
