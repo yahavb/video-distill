@@ -4,32 +4,44 @@
 # server has a global inference lock, so there is no client-side parallelism to
 # gain; more CPU replicas would just queue behind the same trn2 chip).
 #
-# Scale reality at ~11.3s/clip serialized: ~20k val clips ≈ ~63h single-server.
-# To go N× faster you need N caption-qwen3-vl SERVER replicas + client sharding,
-# not more of this job.
+# Scale reality: ~10s/clip per request. With --concurrency 2 across the 2
+# caption-qwen3-vl server pods, effective ~5s/clip -> ~20k val clips in ~28h.
+# To go faster you need MORE caption-qwen3-vl SERVER pods + a higher
+# --concurrency to match, not more of this client.
 #
 # S3 write policy: /var/mdl is a slow S3-backed PVC. We keep ALL per-clip I/O on
 # local emptyDir /scratch and copy to /var/mdl ONCE PER PART (20 writes total,
 # not per-clip). A single end-of-run write would risk losing ~2.5 days of work
 # if the pod is reclaimed; per-part gives crash-safety + resume with minimal S3.
 #
-# Resume: on (re)start, each part whose output already exists on /var/mdl is
-# seeded back to /scratch and the captioner skips clip_ids already present, so a
-# restarted pod continues where it stopped. Delete a part's .jsonl on /var/mdl
-# to force a re-caption of that part.
-apiVersion: batch/v1
-kind: Job
+# Resume: on (re)start, any part whose .jsonl already exists on /var/mdl is
+# skipped entirely (no re-download, no re-caption). The pod continues at the
+# first unfinished part. Delete a part's .jsonl on /var/mdl to force a redo.
+#
+# Why a Deployment (not a Job): a crashed/evicted pod is AUTOMATICALLY replaced
+# and the replacement fast-skips completed parts and continues — no manual
+# re-apply, no backoffLimit to exhaust. Resume granularity is per-part: a crash
+# mid-part loses only that part's partial local scratch (never persisted) and it
+# restarts from clip 0. When all parts are done the script parks on `sleep
+# infinity` so the container does NOT exit (an exit would make the Deployment
+# restart it and re-loop). To STOP: `kubectl delete deployment caption-full-val`.
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: caption-full-val
   namespace: default
 spec:
-  backoffLimit: 3          # allow restarts; resume makes them cheap
+  replicas: 1
+  strategy:
+    type: Recreate          # never run 2 client pods at once (they'd duplicate work)
+  selector:
+    matchLabels:
+      app: caption-full-val
   template:
     metadata:
       labels:
         app: caption-full-val
     spec:
-      restartPolicy: OnFailure
       nodeSelector:
         kubernetes.io/hostname: ip-192-168-151-111.ap-southeast-4.compute.internal
       containers:
@@ -76,9 +88,12 @@ spec:
                 OUT_LOCAL="$WORK/${SPLIT}-part_${n}.jsonl"
                 OUT_PERSIST="$PERSIST_DIR/${SPLIT}-part_${n}.jsonl"
 
-                # Resume: seed local from persisted so done clip_ids are skipped.
+                # Fast-skip completed parts: if already persisted, do NOT
+                # re-download/extract/caption. Makes crash-restart cheap (this is
+                # the whole point of running as a self-resuming Deployment).
                 if [[ -f "$OUT_PERSIST" ]]; then
-                  cp "$OUT_PERSIST" "$OUT_LOCAL"
+                  echo "part $n already complete ($(wc -l < "$OUT_PERSIST") lines), skipping"
+                  continue
                 fi
 
                 # Fresh extract dir per part (bounded disk).
@@ -87,9 +102,12 @@ spec:
                 echo "=== part $n / $((NUM_PARTS-1)) ==="
                 wget -c -q "${BASE_URL}/part_${n}.tar.gz" -O "$WORK/part.tar.gz"
                 tar zxf "$WORK/part.tar.gz" -C "$WORK/k400/${SPLIT}"
-                rm -f "$WORK/part.tar.gz"
+                rm -f "$WORK/part.tar.gz"     # free space before captioning
 
-                # Caption ALL clips in this part (frac=1.0, no cap).
+                # Caption ALL clips in this part (frac=1.0, no cap). Output goes
+                # to LOCAL scratch; if the pod crashed mid-part previously, that
+                # partial local file is gone (emptyDir), so this part restarts
+                # from clip 0 — resume granularity is per-part.
                 python3 "$WORK/video-distill/caption_kinetics.py" \
                   --videos-dir "$WORK/k400/${SPLIT}" \
                   --out "$OUT_LOCAL" \
@@ -104,11 +122,17 @@ spec:
 
                 # ONE S3 write for this part.
                 cp "$OUT_LOCAL" "$OUT_PERSIST"
-                echo "Persisted part $n -> $OUT_PERSIST ($(wc -l < "$OUT_LOCAL") lines)"
+                rm -f "$OUT_LOCAL"           # free scratch after persisting
+                echo "Persisted part $n -> $OUT_PERSIST ($(wc -l < "$OUT_PERSIST") lines)"
               done
 
+              # DONE sentinel: all parts persisted. As a Deployment the container
+              # must NOT exit (that would trigger an endless restart -> re-loop).
+              # Park idle so the pod stays Running/green until you tear it down.
               echo "ALL PARTS DONE. Corpus at $PERSIST_DIR"
-              wc -l "$PERSIST_DIR"/*.jsonl | tail -1
+              wc -l "$PERSIST_DIR"/*.jsonl | tail -1 || true
+              echo "Parking (Deployment stays alive). Delete the deployment to stop."
+              sleep infinity
           resources:
             requests:
               cpu: "8"
